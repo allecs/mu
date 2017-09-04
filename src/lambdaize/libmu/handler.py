@@ -5,6 +5,7 @@ import subprocess
 import sys
 import traceback
 
+
 import boto3
 
 from libmu.defs import Defs
@@ -110,6 +111,7 @@ def _background(runner, vals, queuemsg):
         sock.send(msg)
         sock.close()
         sys.exit(retval)
+
 
 ###
 #  tell the client to retrieve a segment from S3
@@ -228,6 +230,96 @@ def do_close_connect(_, vals):
     vals['cmdsock'].enqueue('OK:CLOSE_CONNECT')
     return False
 
+
+def do_emit(msg, vals):
+    """Emit the whole directory to the intermediate store (including filenames if possible)
+    msg := local_dir_to_emit URI
+    URI := s3://key (key includes bucket name) | redis://key | file://local_dir (file:// needs a relay server or NAT traverse)
+    """
+
+    local_dir = msg.split(' ', 1)[0]
+    local_dir = local_dir.replace("##TMPDIR##", vals['_tmpdir'])
+    local_dir = local_dir.rstrip('/')
+
+    protocol = msg.split(' ', 1)[1].split('://', 1)[0]
+    key = msg.split(' ', 1)[1].split('://', 1)[1]
+
+    filelist = os.listdir(local_dir)
+
+    donemsg = 'OK:EMIT(%s->%s)' % (local_dir, msg.split(' ', 1)[1])
+
+    if protocol == 's3':
+        bucket = key.split('/', 1)[0]
+        prefix = key.split('/', 1)[1].rstrip('/')
+        for f in filelist:
+            try:
+                s3_client.upload_file(local_dir+'/'+f, bucket, prefix+'/'+f)
+            except:
+                donemsg = 'FAIL:EMIT(%s->%s\n%s)' % (local_dir, bucket+'/'+prefix+'/'+f, traceback.format_exc())
+                break
+
+    elif protocol == 'redis':
+        raise Exception('not implemented yet')
+
+    elif protocol == 'file':
+        raise Exception('not implemented yet')
+
+    else:
+        donemsg = 'FAIL(unknown protocol: %s)' % protocol
+
+    if vals.get('cmdsock') is not None:
+        vals['cmdsock'].enqueue(donemsg)
+    return False
+
+
+def do_collect(msg, vals):
+    """Collect the whole directory from the intermediate store (including filenames if possible)
+    msg := URI local_dir_to_store
+    URI := s3://key (key includes bucket name) | redis://key | file://worker_id/local_dir (file:// needs a relay server or NAT traverse)
+    """
+    local_dir = msg.split(' ', 1)[1]
+    local_dir = local_dir.replace("##TMPDIR##", vals['_tmpdir'])
+    local_dir = local_dir.rstrip('/')
+
+    protocol = msg.split(' ', 1)[0].split('://', 1)[0]
+    key = msg.split(' ', 1)[0].split('://', 1)[1]
+
+    if protocol == 's3':
+        bucket = key.split('/', 1)[0]
+        prefix = key.split('/', 1)[1].rstrip('/')
+        filename = ''
+
+        contents = []
+        try:
+            contents = s3_client.list_objects(Bucket=bucket, Prefix=prefix)['Contents']
+        except KeyError:
+            print "collect: no objects found"
+            pass
+
+        for o in contents:
+            try:
+                filename = o['Key'].split('/')[-1]
+                s3_client.download_file(bucket, o['Key'], local_dir+'/'+filename)
+            except:
+                donemsg = 'FAIL:COLLECT(%s->%s\n%s)' % ('s3://'+bucket+'/'+o['Key'], local_dir+'/'+filename, traceback.format_exc())
+                break
+        else:
+            donemsg = 'OK:COLLECT(%s->%s), get %d objects' % (msg.split(' ', 1)[0], local_dir, len(contents))
+
+    elif protocol == 'redis':
+        raise Exception('not implemented yet')
+
+    elif protocol == 'file':
+        raise Exception('not implemented yet')
+
+    else:
+        donemsg = 'FAIL(unknown protocol: %s)' % protocol
+
+    if vals.get('cmdsock') is not None:
+        vals['cmdsock'].enqueue(donemsg)
+    return False
+
+
 ###
 #  dispatch to handler functions
 ###
@@ -236,6 +328,8 @@ message_types = { 'set:': do_set
                 , 'get:': do_get
                 , 'geti:': do_geti
                 , 'dump_vals:': do_dump_vals
+                , 'emit:': do_emit
+                , 'collect:': do_collect
                 , 'retrieve:': do_retrieve
                 , 'upload:': do_upload
                 , 'echo:': do_echo
@@ -270,6 +364,8 @@ message_responses = { 'set': 'OK:SET'
                     , 'connect': 'OK:CONNECT'
                     , 'close_connect': 'OK:CLOSE_CONNECT'
                     }
+
+
 def expected_response(msg):
     cmd = msg.split(':', 1)[0]
     expected = message_responses.get(cmd, "OK")
